@@ -2,6 +2,7 @@ const DEFAULT_API_BASE = "http://192.168.28.1:1000";
 const DEFAULT_ROUTING_PATH = "/opt/etc/xray/configs/05_routing.json";
 const DEFAULT_INBOUND_TAGS = [];
 const DEFAULT_OUTBOUND_TAG = "";
+const DEFAULT_INCLUDE_ROOT_DOMAIN = false;
 const AUTH_HINT = "Открой XKeen-UI и войди в панель, потом повтори действие.";
 const CONFIG_CACHE_TTL_MS = 3000;
 const SERVICE_STATUS_CACHE_TTL_MS = 1500;
@@ -26,6 +27,7 @@ const el = {
   listPath: document.getElementById("list-path"),
   inboundTag: document.getElementById("inbound-tag"),
   outboundTag: document.getElementById("outbound-tag"),
+  includeRootDomain: document.getElementById("include-root-domain"),
   checkBtn: document.getElementById("check-btn"),
   restartBtn: document.getElementById("restart-btn"),
   addBtn: document.getElementById("add-btn"),
@@ -222,23 +224,24 @@ function toggleSelectAllTrackedDomains() {
   updateTrackedDomainsMetaAndToggle();
 }
 
-function buildDomainLines(domains) {
-  const normalizedDomains = uniqSortedTags((domains || []).map(normalizeDomain).filter(Boolean));
-  return normalizedDomains.map(lineForDomain);
-}
+function buildDomainLines(domains, options = {}) {
+  const includeRootDomain = Boolean(options.includeRootDomain);
+  const candidates = [];
 
-function applyDomainLinesToRule(rule, domainLines) {
-  const existing = new Set(getRuleDomains(rule));
-  let changed = false;
-  for (const line of domainLines) {
-    if (existing.has(line)) continue;
-    existing.add(line);
-    changed = true;
+  for (const raw of domains || []) {
+    const normalized = normalizeDomain(raw);
+    if (!normalized) continue;
+    candidates.push(normalized);
+
+    if (includeRootDomain) {
+      const registrable = toRegistrableDomain(normalized);
+      if (registrable) {
+        candidates.push(registrable);
+      }
+    }
   }
-  if (changed) {
-    setRuleDomains(rule, [...existing]);
-  }
-  return changed;
+
+  return uniqSortedTags(candidates).map(lineForDomain);
 }
 
 async function addDomainLinesForContext(ctx, domainLines) {
@@ -256,29 +259,25 @@ async function addDomainLinesForContext(ctx, domainLines) {
   const rulesToInsert = [];
 
   for (const inboundTag of ctx.inboundTags) {
-    const matched = findRulesForInbound(rules, inboundTag, ctx.outboundTag);
-    if (matched.length > 0) {
-      const targetRule = matched[0];
-      const existingInAny = new Set();
-      for (const rule of matched) {
-        for (const domain of getRuleDomains(rule)) {
-          existingInAny.add(domain);
-        }
+    const matched = findManagedRulesForInbound(rules, inboundTag, ctx.outboundTag);
+    const existingInAny = new Set();
+    for (const rule of matched) {
+      for (const domain of getRuleDomains(rule)) {
+        existingInAny.add(domain);
       }
+    }
 
-      const missingLines = domainLines.filter((line) => !existingInAny.has(line));
-      if (missingLines.length) {
-        const lineChanged = applyDomainLinesToRule(targetRule, missingLines);
-        if (lineChanged) changed = true;
-      }
+    const missingLines = domainLines.filter((line) => !existingInAny.has(line));
+    if (!missingLines.length) {
       continue;
     }
 
     const newRule = {
       type: "field",
+      comment: "xkeen-auto-domain",
       inboundTag: [inboundTag],
       outboundTag: ctx.outboundTag,
-      domain: [...domainLines],
+      domain: [...missingLines],
     };
     rulesToInsert.push(newRule);
     changed = true;
@@ -322,7 +321,8 @@ function getSelectedValues(selectEl) {
 }
 
 function buildRoutingHint(ctx) {
-  return `Файл роутинга: ${ctx.routingPath} | inboundTags: [${ctx.inboundTags.join(", ")}] | outboundTag: ${ctx.outboundTag}`;
+  const domainMode = ctx.includeRootDomain ? "поддомен + корневой" : "поддомен";
+  return `Файл роутинга: ${ctx.routingPath} | inboundTags: [${ctx.inboundTags.join(", ")}] | outboundTag: ${ctx.outboundTag} | домен: ${domainMode}`;
 }
 
 function setSavedSettingsStatus(prefix = "Сохранено") {
@@ -346,6 +346,7 @@ function getSettingsFromInputs() {
     routingPath: toRoutingPath(el.listPath.value),
     inboundTags: getSelectedValues(el.inboundTag),
     outboundTag: toTag(el.outboundTag.value),
+    includeRootDomain: Boolean(el.includeRootDomain.checked),
   };
 }
 
@@ -355,6 +356,7 @@ function toActionContext(settings) {
     routingPath: toRoutingPath(settings.routingPath),
     inboundTags: uniqSortedTags(settings.inboundTags),
     outboundTag: toTag(settings.outboundTag),
+    includeRootDomain: Boolean(settings.includeRootDomain),
   };
 }
 
@@ -365,6 +367,7 @@ async function saveSettingsToStorage(settings) {
     inboundTags: settings.inboundTags,
     inboundTag: settings.inboundTags[0] || "",
     outboundTag: settings.outboundTag,
+    includeRootDomain: Boolean(settings.includeRootDomain),
     listPath: settings.routingPath,
   });
 }
@@ -408,6 +411,61 @@ function normalizeDomain(hostname) {
     return "";
   }
   return domain;
+}
+
+function toRegistrableDomain(domain) {
+  const normalized = normalizeDomain(domain);
+  if (!normalized) return "";
+
+  const labels = normalized.split(".").filter(Boolean);
+  if (labels.length <= 2) {
+    return normalized;
+  }
+
+  const commonSecondLevelSuffixes = new Set([
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "co.jp",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.nz",
+    "com.br",
+    "com.tr",
+    "com.cn",
+    "com.hk",
+    "com.sg",
+    "com.my",
+    "co.id",
+    "co.in",
+    "firm.in",
+    "net.in",
+    "org.in",
+    "gen.in",
+    "ind.in",
+    "co.kr",
+    "or.kr",
+    "ne.kr",
+    "re.kr",
+    "ac.kr",
+    "co.il",
+    "org.il",
+    "gov.il",
+    "ac.il",
+    "com.mx",
+    "com.ar",
+    "com.ua",
+    "co.za",
+  ]);
+
+  const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
+  if (commonSecondLevelSuffixes.has(lastTwo) && labels.length >= 3) {
+    return `${labels[labels.length - 3]}.${lastTwo}`;
+  }
+
+  return lastTwo;
 }
 
 async function getActiveTab() {
@@ -472,6 +530,7 @@ async function getSettingsFromStorage() {
     inboundTags: DEFAULT_INBOUND_TAGS,
     inboundTag: "",
     outboundTag: DEFAULT_OUTBOUND_TAG,
+    includeRootDomain: DEFAULT_INCLUDE_ROOT_DOMAIN,
   });
 
   const inboundTags = Array.isArray(result.inboundTags)
@@ -483,6 +542,7 @@ async function getSettingsFromStorage() {
     routingPath: toRoutingPath(result.routingPath || result.listPath || result.listPathTemplate),
     inboundTags,
     outboundTag: toTag(result.outboundTag),
+    includeRootDomain: Boolean(result.includeRootDomain),
   };
 }
 
@@ -949,6 +1009,29 @@ function findRulesForInbound(rules, inboundTag, outboundTag) {
   return rules.filter((rule) => matchesSingleInboundRule(rule, inboundTag, outboundTag));
 }
 
+function isManagedDomainRule(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (isEndFieldRule(rule)) return false;
+
+  const hasSpecialSelectors =
+    "ip" in rule ||
+    "port" in rule ||
+    "network" in rule ||
+    "protocol" in rule ||
+    "source" in rule ||
+    "sourcePort" in rule ||
+    "sourceIp" in rule;
+  if (hasSpecialSelectors) return false;
+
+  const domains = getRuleDomains(rule);
+  if (!domains.length) return false;
+  return domains.every((line) => line.startsWith("domain:"));
+}
+
+function findManagedRulesForInbound(rules, inboundTag, outboundTag) {
+  return findRulesForInbound(rules, inboundTag, outboundTag).filter(isManagedDomainRule);
+}
+
 function isEndFieldRule(rule) {
   if (!rule || typeof rule !== "object") return false;
   return typeof rule.comment === "string" && rule.comment.trim().toLowerCase() === "end field";
@@ -1069,10 +1152,11 @@ async function checkDomainRules(ctx) {
 
   const root = parseRoutingJson(routingFile.content);
   const rules = ensureRules(root, false);
-  const line = lineForDomain(state.currentDomain);
-  const existsForAll = ctx.inboundTags.every((inboundTag) =>
-    findRulesForInbound(rules, inboundTag, ctx.outboundTag).some((rule) => getRuleDomains(rule).includes(line)),
-  );
+  const lines = buildDomainLines([state.currentDomain], { includeRootDomain: ctx.includeRootDomain });
+  const existsForAll = ctx.inboundTags.every((inboundTag) => {
+    const matched = findManagedRulesForInbound(rules, inboundTag, ctx.outboundTag);
+    return lines.every((line) => matched.some((rule) => getRuleDomains(rule).includes(line)));
+  });
 
   return {
     status: existsForAll ? "Уже есть" : "Не найдено",
@@ -1091,7 +1175,7 @@ async function performAdd() {
   await saveSettingsToStorage(settings);
 
   const ctx = toActionContext(settings);
-  const lines = buildDomainLines([state.currentDomain]);
+  const lines = buildDomainLines([state.currentDomain], { includeRootDomain: ctx.includeRootDomain });
   if (!lines.length) {
     setStatus("Не найдено", "Текущий домен не подходит для добавления.");
     await refreshServiceStatus();
@@ -1115,7 +1199,7 @@ async function performAddTrackedDomains() {
   await saveSettingsToStorage(settings);
 
   const ctx = toActionContext(settings);
-  const lines = buildDomainLines(selectedDomains);
+  const lines = buildDomainLines(selectedDomains, { includeRootDomain: ctx.includeRootDomain });
   if (!lines.length) {
     setStatus("Не найдено", "Нет доменов, подходящих для добавления.");
     await refreshServiceStatus();
@@ -1147,15 +1231,20 @@ async function performRemove() {
 
   const root = parseRoutingJson(routingFile.content);
   const rules = ensureRules(root, false);
-  const line = lineForDomain(state.currentDomain);
+  const linesToRemove = new Set(buildDomainLines([state.currentDomain], { includeRootDomain: ctx.includeRootDomain }));
+  if (!linesToRemove.size) {
+    setStatus("Не найдено", "Текущий домен не подходит для удаления.");
+    await refreshServiceStatus();
+    return;
+  }
 
   let removed = false;
 
   for (const inboundTag of ctx.inboundTags) {
-    const matched = findRulesForInbound(rules, inboundTag, ctx.outboundTag);
+    const matched = findManagedRulesForInbound(rules, inboundTag, ctx.outboundTag);
     for (const rule of matched) {
       const domains = getRuleDomains(rule);
-      const filtered = domains.filter((item) => item !== line);
+      const filtered = domains.filter((item) => !linesToRemove.has(item));
       if (filtered.length !== domains.length) {
         removed = true;
         setRuleDomains(rule, filtered);
@@ -1242,6 +1331,7 @@ async function initialize() {
   const settings = await getSettingsFromStorage();
   el.apiBase.value = settings.apiBase;
   el.listPath.value = settings.routingPath;
+  el.includeRootDomain.checked = Boolean(settings.includeRootDomain);
 
   setMultiSelectOptions(el.inboundTag, [], settings.inboundTags);
   setSingleSelectOptions(el.outboundTag, [], settings.outboundTag);
@@ -1282,6 +1372,7 @@ el.apiBase.addEventListener("input", scheduleAutoSave);
 el.listPath.addEventListener("input", scheduleAutoSave);
 el.inboundTag.addEventListener("change", scheduleAutoSave);
 el.outboundTag.addEventListener("change", scheduleAutoSave);
+el.includeRootDomain.addEventListener("change", scheduleAutoSave);
 el.trackedDomains.addEventListener("change", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLInputElement)) return;
