@@ -35,6 +35,7 @@ Chrome Extension (Manifest V3) для быстрого добавления/уд
 ## Обязательные требования
 
 - Роутер с установленными XKeen и XKeen-UI.
+- XKeen-UI: [https://github.com/zxc-rv/XKeen-UI](https://github.com/zxc-rv/XKeen-UI)
 - Доступный XKeen-UI API (по умолчанию `http://192.168.28.1:1000`).
 - Успешный вход в XKeen-UI (активная cookie-сессия в браузере).
 - Доступ к файлу роутинга через API: `/opt/etc/xray/configs/05_routing.json` (или ваш путь в настройке `Файл роутинга (.json)`).
