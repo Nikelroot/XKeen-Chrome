@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XKeen Domain Router</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>XKeen Domain Router</h1>
+
+      <section class="card">
+        <p class="label">Текущий домен</p>
+        <p id="current-domain" class="domain">Определение...</p>
+      </section>
+
+      <section class="card settings">
+        <label for="api-base">Адрес XKeen-UI API</label>
+        <input id="api-base" type="text" placeholder="http://192.168.28.1:1000" />
+
+        <label for="list-path">Файл роутинга (.json)</label>
+        <input id="list-path" type="text" placeholder="/opt/etc/xray/configs/05_routing.json" />
+
+        <label for="inbound-tag">inboundTag</label>
+        <select id="inbound-tag" multiple size="6">
+          <option value="">Загрузка...</option>
+        </select>
+
+        <label for="outbound-tag">outboundTag</label>
+        <select id="outbound-tag">
+          <option value="">Загрузка...</option>
+        </select>
+
+      </section>
+
+      <section class="actions">
+        <button id="check-btn" class="btn" type="button">Проверить статус</button>
+        <button id="restart-btn" class="btn btn-warning" type="button">Перезапустить сервис</button>
+        <button id="add-btn" class="btn btn-primary" type="button">Добавить домен</button>
+        <button id="remove-btn" class="btn btn-danger" type="button">Удалить домен</button>
+      </section>
+
+      <section class="card status-card">
+        <p class="label">Статус</p>
+        <p id="status" class="status">Готово</p>
+        <p id="hint" class="hint"></p>
+      </section>
+
+      <section class="card service-card">
+        <p class="label">Статус XKeen</p>
+        <p id="service-status" class="service-status">Не проверен</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
