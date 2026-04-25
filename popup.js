@@ -3,13 +3,22 @@ const DEFAULT_ROUTING_PATH = "/opt/etc/xray/configs/05_routing.json";
 const DEFAULT_INBOUND_TAGS = [];
 const DEFAULT_OUTBOUND_TAG = "";
 const AUTH_HINT = "Открой XKeen-UI и войди в панель, потом повтори действие.";
+const CONFIG_CACHE_TTL_MS = 3000;
+const SERVICE_STATUS_CACHE_TTL_MS = 1500;
 
 const state = {
+  activeTabId: -1,
   currentDomain: "",
+  trackedDomains: [],
+  selectedTrackedDomains: new Set(),
   availableInboundTags: [],
   availableOutboundTags: [],
 };
 let autoSaveTimerId = null;
+const runtimeCache = {
+  configsByApiBase: new Map(),
+  serviceStatusByApiBase: new Map(),
+};
 
 const el = {
   currentDomain: document.getElementById("current-domain"),
@@ -21,9 +30,13 @@ const el = {
   restartBtn: document.getElementById("restart-btn"),
   addBtn: document.getElementById("add-btn"),
   removeBtn: document.getElementById("remove-btn"),
+  addTrackedBtn: document.getElementById("add-tracked-btn"),
+  selectAllTrackedBtn: document.getElementById("select-all-tracked-btn"),
   status: document.getElementById("status"),
   hint: document.getElementById("hint"),
   serviceStatus: document.getElementById("service-status"),
+  trackedDomainsMeta: document.getElementById("tracked-domains-meta"),
+  trackedDomains: document.getElementById("tracked-domains"),
 };
 
 function setStatus(status, hint = "") {
@@ -36,10 +49,255 @@ function setLoading(loading) {
   el.restartBtn.disabled = loading;
   el.addBtn.disabled = loading;
   el.removeBtn.disabled = loading;
+  el.addTrackedBtn.disabled = loading;
+  el.selectAllTrackedBtn.disabled = loading;
 }
 
 function setServiceStatus(text) {
   el.serviceStatus.textContent = text;
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function invalidateConfigCache(apiBase) {
+  if (!apiBase) return;
+  runtimeCache.configsByApiBase.delete(apiBase);
+}
+
+function setCachedServiceStatus(apiBase, status) {
+  if (!apiBase) return;
+  runtimeCache.serviceStatusByApiBase.set(apiBase, {
+    status,
+    at: nowMs(),
+  });
+}
+
+function normalizeTrackedDomainItems(rawItems) {
+  if (!Array.isArray(rawItems)) return [];
+
+  const items = [];
+  for (const item of rawItems) {
+    if (typeof item === "string") {
+      const domain = toTag(item);
+      if (!domain) continue;
+      items.push({
+        domain,
+        status: "ok",
+        hits: 0,
+        lastStatusCode: 0,
+      });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const domain = toTag(item.domain);
+    if (!domain) continue;
+    items.push({
+      domain,
+      status: toTag(item.status) || "pending",
+      hits: Number(item.hits) || 0,
+      lastStatusCode: Number(item.lastStatusCode) || 0,
+    });
+  }
+
+  const statusRank = (status) => {
+    const key = statusVisual(status).key;
+    if (key === "error") return 0;
+    if (key === "pending") return 1;
+    if (key === "redirect") return 2;
+    if (key === "ok") return 3;
+    return 9;
+  };
+
+  items.sort((a, b) => {
+    const rankDiff = statusRank(a.status) - statusRank(b.status);
+    if (rankDiff !== 0) return rankDiff;
+    return a.domain.localeCompare(b.domain);
+  });
+  return items;
+}
+
+function statusVisual(status) {
+  switch (status) {
+    case "ok":
+      return { key: "ok", label: "OK" };
+    case "redirect":
+      return { key: "redirect", label: "Redirect" };
+    case "error":
+      return { key: "error", label: "Error" };
+    default:
+      return { key: "pending", label: "Pending" };
+  }
+}
+
+function buildTrackedDomainsMeta(items, selectedCount) {
+  const counters = {
+    ok: 0,
+    redirect: 0,
+    error: 0,
+    pending: 0,
+  };
+
+  for (const item of items) {
+    const key = statusVisual(item.status).key;
+    counters[key] += 1;
+  }
+
+  return `Найдено: ${items.length} | выбрано: ${selectedCount} | OK: ${counters.ok} | Redirect: ${counters.redirect} | Error: ${counters.error} | Pending: ${counters.pending}`;
+}
+
+function updateTrackedDomainsMetaAndToggle(metaText = "") {
+  const items = state.trackedDomains;
+  const selectedCount = state.selectedTrackedDomains.size;
+  const allSelected = selectedCount > 0 && selectedCount === items.length;
+  el.selectAllTrackedBtn.textContent = allSelected ? "Снять выбор" : "Выбрать все";
+  el.trackedDomainsMeta.textContent = metaText || buildTrackedDomainsMeta(items, selectedCount);
+}
+
+function renderTrackedDomains(domainItems, metaText = "") {
+  const items = normalizeTrackedDomainItems(domainItems);
+  const selected = new Set(items.map((item) => item.domain).filter((domain) => state.selectedTrackedDomains.has(domain)));
+  state.selectedTrackedDomains = selected;
+  state.trackedDomains = items;
+
+  el.trackedDomains.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "tracked-empty";
+    empty.textContent = "Пока нет запросов";
+    el.trackedDomains.appendChild(empty);
+    el.selectAllTrackedBtn.textContent = "Выбрать все";
+    el.trackedDomainsMeta.textContent = metaText || "Открой страницу и выполни сетевые запросы.";
+    return;
+  }
+
+  for (const item of items) {
+    const visual = statusVisual(item.status);
+    const li = document.createElement("li");
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    const text = document.createElement("span");
+    const badge = document.createElement("span");
+
+    label.className = "tracked-domain-row";
+    label.classList.add(`req-${visual.key}`);
+    text.className = "tracked-domain-text";
+    badge.className = `tracked-domain-badge req-${visual.key}`;
+    checkbox.type = "checkbox";
+    checkbox.dataset.domain = item.domain;
+    checkbox.checked = selected.has(item.domain);
+    text.textContent = item.domain;
+    badge.textContent = visual.label;
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+    label.appendChild(badge);
+    li.appendChild(label);
+    el.trackedDomains.appendChild(li);
+  }
+
+  updateTrackedDomainsMetaAndToggle(metaText);
+}
+
+function getSelectedTrackedDomains() {
+  return [...state.selectedTrackedDomains].sort((a, b) => a.localeCompare(b));
+}
+
+function toggleSelectAllTrackedDomains() {
+  if (!state.trackedDomains.length) return;
+
+  const selectedCount = state.selectedTrackedDomains.size;
+  if (selectedCount === state.trackedDomains.length) {
+    state.selectedTrackedDomains = new Set();
+  } else {
+    state.selectedTrackedDomains = new Set(state.trackedDomains.map((item) => item.domain));
+  }
+
+  const checkboxes = el.trackedDomains.querySelectorAll('input[type="checkbox"][data-domain]');
+  checkboxes.forEach((checkbox) => {
+    const domain = toTag(checkbox.dataset.domain);
+    checkbox.checked = state.selectedTrackedDomains.has(domain);
+  });
+  updateTrackedDomainsMetaAndToggle();
+}
+
+function buildDomainLines(domains) {
+  const normalizedDomains = uniqSortedTags((domains || []).map(normalizeDomain).filter(Boolean));
+  return normalizedDomains.map(lineForDomain);
+}
+
+function applyDomainLinesToRule(rule, domainLines) {
+  const existing = new Set(getRuleDomains(rule));
+  let changed = false;
+  for (const line of domainLines) {
+    if (existing.has(line)) continue;
+    existing.add(line);
+    changed = true;
+  }
+  if (changed) {
+    setRuleDomains(rule, [...existing]);
+  }
+  return changed;
+}
+
+async function addDomainLinesForContext(ctx, domainLines) {
+  const routingFile = await readRoutingFile(ctx.apiBase, ctx.routingPath);
+  if (!routingFile.exists) {
+    return {
+      status: "Не найдено",
+      hint: `Файл роутинга не найден: ${ctx.routingPath}`,
+    };
+  }
+
+  const root = parseRoutingJson(routingFile.content);
+  const rules = ensureRules(root, true);
+  let changed = false;
+  const rulesToInsert = [];
+
+  for (const inboundTag of ctx.inboundTags) {
+    const matched = findRulesForInbound(rules, inboundTag, ctx.outboundTag);
+    if (matched.length > 0) {
+      const targetRule = matched[0];
+      const existingInAny = new Set();
+      for (const rule of matched) {
+        for (const domain of getRuleDomains(rule)) {
+          existingInAny.add(domain);
+        }
+      }
+
+      const missingLines = domainLines.filter((line) => !existingInAny.has(line));
+      if (missingLines.length) {
+        const lineChanged = applyDomainLinesToRule(targetRule, missingLines);
+        if (lineChanged) changed = true;
+      }
+      continue;
+    }
+
+    const newRule = {
+      type: "field",
+      inboundTag: [inboundTag],
+      outboundTag: ctx.outboundTag,
+      domain: [...domainLines],
+    };
+    rulesToInsert.push(newRule);
+    changed = true;
+  }
+
+  insertRulesBeforeEndField(rules, rulesToInsert);
+
+  if (!changed) {
+    return {
+      status: "Уже есть",
+      hint: `${buildRoutingHint(ctx)} | доменов: ${domainLines.length}`,
+    };
+  }
+
+  await writeRoutingFile(ctx.apiBase, ctx.routingPath, serializeJson(root));
+  return {
+    status: "Добавлено",
+    hint: `${buildRoutingHint(ctx)} | доменов: ${domainLines.length}`,
+  };
 }
 
 function toApiBase(value) {
@@ -152,16 +410,14 @@ function normalizeDomain(hostname) {
   return domain;
 }
 
-function lineForDomain(domain) {
-  return `domain:${domain}`;
+async function getActiveTab() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs.length) return null;
+  return tabs[0];
 }
 
-async function getActiveTabDomain() {
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tabs.length) return "";
-
-  const tab = tabs[0];
-  if (!tab.url) return "";
+function getDomainFromTab(tab) {
+  if (!tab || !tab.url) return "";
 
   let parsed;
   try {
@@ -175,6 +431,36 @@ async function getActiveTabDomain() {
   }
 
   return normalizeDomain(parsed.hostname);
+}
+
+async function getActiveTabDomain(tab) {
+  const activeTab = tab || (await getActiveTab());
+  return getDomainFromTab(activeTab);
+}
+
+function lineForDomain(domain) {
+  return `domain:${domain}`;
+}
+
+async function refreshTrackedDomainsForTab(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    state.trackedDomains = [];
+    renderTrackedDomains([], "Текущая вкладка не определена.");
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "xkeen.getTrackedDomains",
+      tabId,
+    });
+
+    const domains = normalizeTrackedDomainItems(response?.domains);
+    renderTrackedDomains(domains);
+  } catch {
+    state.trackedDomains = [];
+    renderTrackedDomains([], "Не удалось получить домены запросов.");
+  }
 }
 
 async function getSettingsFromStorage() {
@@ -345,10 +631,9 @@ function extractConfigFiles(configResponse) {
   return filesMap;
 }
 
-function extractAvailableTagsFromConfigs(configResponse) {
+function extractAvailableTagsFromFiles(files) {
   const inboundSet = new Set();
   const outboundSet = new Set();
-  const files = extractConfigFiles(configResponse);
 
   for (const [path, content] of files.entries()) {
     if (!path.endsWith(".json")) {
@@ -367,6 +652,33 @@ function extractAvailableTagsFromConfigs(configResponse) {
     inboundTags: [...inboundSet].sort((a, b) => a.localeCompare(b)),
     outboundTags: [...outboundSet].sort((a, b) => a.localeCompare(b)),
   };
+}
+
+async function getConfigSnapshot(apiBase, options = {}) {
+  const force = Boolean(options.force);
+  const key = toApiBase(apiBase);
+  const cached = runtimeCache.configsByApiBase.get(key);
+  const current = nowMs();
+
+  if (!force && cached && current - cached.at < CONFIG_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  const response = await apiRequest(key, "GET");
+  if (!response.ok) {
+    throw createError("request_failed", `Ошибка API: ${response.status}`);
+  }
+
+  const files = extractConfigFiles(response.data);
+  const tags = extractAvailableTagsFromFiles(files);
+  const snapshot = {
+    at: current,
+    files,
+    tags,
+  };
+
+  runtimeCache.configsByApiBase.set(key, snapshot);
+  return snapshot;
 }
 
 async function apiRequest(apiBase, method, body) {
@@ -513,8 +825,17 @@ function parseServiceStatus(data) {
   return "Неизвестно";
 }
 
-async function refreshServiceStatus() {
+async function refreshServiceStatus(options = {}) {
   const { apiBase } = getSettingsFromInputs();
+  const force = Boolean(options.force);
+  const cached = runtimeCache.serviceStatusByApiBase.get(apiBase);
+  const current = nowMs();
+
+  if (!force && cached && current - cached.at < SERVICE_STATUS_CACHE_TTL_MS) {
+    setServiceStatus(cached.status);
+    return;
+  }
+
   const paths = ["/api/control", "/api/status"];
   let lastStatus = 0;
 
@@ -522,7 +843,9 @@ async function refreshServiceStatus() {
     const resp = await apiRequestPath(apiBase, path, "GET");
     lastStatus = resp.status;
     if (!resp.ok) continue;
-    setServiceStatus(parseServiceStatus(resp.data));
+    const status = parseServiceStatus(resp.data);
+    setServiceStatus(status);
+    setCachedServiceStatus(apiBase, status);
     return;
   }
 
@@ -531,6 +854,7 @@ async function refreshServiceStatus() {
   }
 
   setServiceStatus("Неизвестно");
+  setCachedServiceStatus(apiBase, "Неизвестно");
 }
 
 function sleep(ms) {
@@ -561,14 +885,10 @@ async function requestServiceRestart(apiBase) {
   throw createError("request_failed", `Не удалось перезапустить сервис (API status: ${lastStatus || "n/a"})`);
 }
 
-async function refreshTagOptions(selectedInbounds = [], selectedOutbound = "") {
+async function refreshTagOptions(selectedInbounds = [], selectedOutbound = "", options = {}) {
   const settings = getSettingsFromInputs();
-  const response = await apiRequest(settings.apiBase, "GET");
-  if (!response.ok) {
-    throw createError("request_failed", `Ошибка API: ${response.status}`);
-  }
-
-  const tags = extractAvailableTagsFromConfigs(response.data);
+  const snapshot = await getConfigSnapshot(settings.apiBase, options);
+  const tags = snapshot.tags;
   state.availableInboundTags = tags.inboundTags;
   state.availableOutboundTags = tags.outboundTags;
 
@@ -580,12 +900,8 @@ async function refreshTagOptions(selectedInbounds = [], selectedOutbound = "") {
 }
 
 async function readRoutingFile(apiBase, routingPath) {
-  const response = await apiRequest(apiBase, "GET");
-  if (!response.ok) {
-    throw createError("request_failed", `Ошибка API: ${response.status}`);
-  }
-
-  const files = extractConfigFiles(response.data);
+  const snapshot = await getConfigSnapshot(apiBase);
+  const files = snapshot.files;
   if (!files.has(routingPath)) {
     return {
       exists: false,
@@ -701,7 +1017,10 @@ async function writeRoutingFile(apiBase, routingPath, content) {
 
   for (const payload of payloads) {
     const resp = await apiRequest(apiBase, "PUT", payload);
-    if (resp.ok) return;
+    if (resp.ok) {
+      invalidateConfigCache(apiBase);
+      return;
+    }
   }
 
   throw createError("request_failed", "Не удалось обновить файл роутинга");
@@ -772,53 +1091,39 @@ async function performAdd() {
   await saveSettingsToStorage(settings);
 
   const ctx = toActionContext(settings);
-  const routingFile = await readRoutingFile(ctx.apiBase, ctx.routingPath);
-  if (!routingFile.exists) {
-    setStatus("Не найдено", `Файл роутинга не найден: ${ctx.routingPath}`);
+  const lines = buildDomainLines([state.currentDomain]);
+  if (!lines.length) {
+    setStatus("Не найдено", "Текущий домен не подходит для добавления.");
     await refreshServiceStatus();
     return;
   }
 
-  const root = parseRoutingJson(routingFile.content);
-  const rules = ensureRules(root, true);
-  const line = lineForDomain(state.currentDomain);
-  let changed = false;
-  const rulesToInsert = [];
+  const result = await addDomainLinesForContext(ctx, lines);
+  setStatus(result.status, result.hint);
+  await refreshServiceStatus();
+}
 
-  for (const inboundTag of ctx.inboundTags) {
-    const matched = findRulesForInbound(rules, inboundTag, ctx.outboundTag);
-    const existsInMatched = matched.some((rule) => getRuleDomains(rule).includes(line));
-    if (existsInMatched) {
-      continue;
-    }
-
-    if (matched.length > 0) {
-      const domains = getRuleDomains(matched[0]);
-      domains.push(line);
-      setRuleDomains(matched[0], domains);
-      changed = true;
-      continue;
-    }
-
-    rulesToInsert.push({
-      type: "field",
-      inboundTag: [inboundTag],
-      outboundTag: ctx.outboundTag,
-      domain: [line],
-    });
-    changed = true;
+async function performAddTrackedDomains() {
+  const selectedDomains = getSelectedTrackedDomains();
+  if (!selectedDomains.length) {
+    setStatus("Не найдено", "Выбери домены запросов для добавления.");
+    return;
   }
 
-  insertRulesBeforeEndField(rules, rulesToInsert);
+  const settings = getSettingsFromInputs();
+  assertTagsSelected(settings);
+  await saveSettingsToStorage(settings);
 
-  if (!changed) {
-    setStatus("Уже есть", buildRoutingHint(ctx));
+  const ctx = toActionContext(settings);
+  const lines = buildDomainLines(selectedDomains);
+  if (!lines.length) {
+    setStatus("Не найдено", "Нет доменов, подходящих для добавления.");
     await refreshServiceStatus();
     return;
   }
 
-  await writeRoutingFile(ctx.apiBase, ctx.routingPath, serializeJson(root));
-  setStatus("Добавлено", buildRoutingHint(ctx));
+  const result = await addDomainLinesForContext(ctx, lines);
+  setStatus(result.status, result.hint);
   await refreshServiceStatus();
 }
 
@@ -877,7 +1182,7 @@ async function performRestartService() {
   setStatus("Перезапуск выполнен");
 
   await sleep(1200);
-  await refreshServiceStatus();
+  await refreshServiceStatus({ force: true });
 }
 
 function mapOperationError(error) {
@@ -920,6 +1225,7 @@ async function runAction(handler) {
 
 async function initialize() {
   setServiceStatus("Проверка...");
+  renderTrackedDomains([], "Загрузка...");
   const serviceStatusPromise = refreshServiceStatus().catch((error) => {
     const mapped = mapOperationError(error);
     if (mapped.status === "Ошибка авторизации") {
@@ -939,10 +1245,13 @@ async function initialize() {
 
   setMultiSelectOptions(el.inboundTag, [], settings.inboundTags);
   setSingleSelectOptions(el.outboundTag, [], settings.outboundTag);
-
-  await refreshTagOptions(settings.inboundTags, settings.outboundTag);
-
-  state.currentDomain = await getActiveTabDomain();
+  const tagsPromise = refreshTagOptions(settings.inboundTags, settings.outboundTag, { force: true });
+  const activeTabPromise = getActiveTab();
+  await tagsPromise;
+  const activeTab = await activeTabPromise;
+  state.activeTabId = typeof activeTab?.id === "number" ? activeTab.id : -1;
+  await refreshTrackedDomainsForTab(state.activeTabId);
+  state.currentDomain = await getActiveTabDomain(activeTab);
   el.currentDomain.textContent = state.currentDomain || "Недоступно";
 
   if (!state.currentDomain) {
@@ -964,7 +1273,7 @@ async function initialize() {
 
 el.apiBase.addEventListener("change", () =>
   runAction(async () => {
-    await refreshTagOptions(getSelectedValues(el.inboundTag), toTag(el.outboundTag.value));
+    await refreshTagOptions(getSelectedValues(el.inboundTag), toTag(el.outboundTag.value), { force: true });
     await saveSettingsToStorage(getSettingsFromInputs());
     setSavedSettingsStatus("Сохранено автоматически");
   }),
@@ -973,6 +1282,22 @@ el.apiBase.addEventListener("input", scheduleAutoSave);
 el.listPath.addEventListener("input", scheduleAutoSave);
 el.inboundTag.addEventListener("change", scheduleAutoSave);
 el.outboundTag.addEventListener("change", scheduleAutoSave);
+el.trackedDomains.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement)) return;
+  if (target.type !== "checkbox") return;
+  const domain = toTag(target.dataset.domain);
+  if (!domain) return;
+
+  if (target.checked) {
+    state.selectedTrackedDomains.add(domain);
+  } else {
+    state.selectedTrackedDomains.delete(domain);
+  }
+  updateTrackedDomainsMetaAndToggle();
+});
+el.selectAllTrackedBtn.addEventListener("click", toggleSelectAllTrackedDomains);
+el.addTrackedBtn.addEventListener("click", () => runAction(performAddTrackedDomains));
 el.checkBtn.addEventListener("click", () => runAction(performCheck));
 el.restartBtn.addEventListener("click", () => runAction(performRestartService));
 el.addBtn.addEventListener("click", () => runAction(performAdd));
